@@ -1,0 +1,11 @@
+name: 功能建议
+description: 说明你想解决的直播复盘问题。
+title: '[Feature] '
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: 使用场景和问题
+      description: 谁会使用，当前有什么不方便，希望怎样改进？
+    validations:
+      required: true

@@ -1,0 +1,31 @@
+Alembic migration environment for the backend database.
+
+The database URL is read from backend/.env through app.config. A process-level
+DATABASE_URL environment variable takes precedence.
+
+Run migrations from the backend directory:
+
+    python -m alembic upgrade head
+
+Inspect the current revision:
+
+    python -m alembic current
+
+Create a future migration after changing app/models.py:
+
+    python -m alembic revision --autogenerate -m "describe the schema change"
+
+This repository adopted Alembic after the base schema already existed. The
+first revision manages the R3 table only. For a brand-new database, initialize
+the base tables once before recording the Alembic revision:
+
+    python -c "from app.db import init_db; init_db()"
+    python -m alembic upgrade head
+
+The first revision inspects the live schema so that databases previously
+initialized by create_all() can be adopted safely. It must be run online;
+`alembic upgrade head --sql` is intentionally unsupported.
+
+Back up a production database before upgrading. Downgrade is intentionally
+blocked because this revision may adopt an existing R3 table with historical
+analysis data; blindly dropping that table would cause data loss.

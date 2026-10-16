@@ -1,0 +1,1085 @@
+"""复盘场次接口：建场/解析/起停/主播切换/查询(可按主播)/下载/彻底删除/视频代理 + WS。"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote
+
+from fastapi import (
+    APIRouter, Body, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect,
+)
+from fastapi.responses import (
+    FileResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse,
+)
+from starlette.background import BackgroundTask
+from ..core import media_store
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..bus import bus
+from ..config import get_settings, public_url
+from ..core import douyin
+from ..core.embed import retrieve_detailed
+from ..core.live import open_live_stream
+from ..core.llm import get_llm
+from ..core.pipeline import get_running, start_pipeline, stop_pipeline
+from ..db import get_db
+from ..models import (
+    AudioStatus,
+    CompassPoint,
+    Critique,
+    CritiqueLevel,
+    LiveRoom,
+    OcrRecord,
+    ReplaySession,
+    SessionStatus,
+    Streamer,
+    StreamerTurn,
+    Transcript,
+)
+from ..schemas import (
+    AudioOut,
+    CritiqueOut,
+    SessionCreate,
+    SessionOut,
+    StreamerOut,
+    StreamerReviewOut,
+    SwitchIn,
+    TranscriptOut,
+)
+from ..storage.audio import get_audio, hard_delete_audio
+
+router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+
+
+def _session_out(db: Session, row: ReplaySession) -> SessionOut:
+    try:
+        lineup_ids = json.loads(row.lineup) if row.lineup else []
+    except json.JSONDecodeError:
+        lineup_ids = []
+    smap = {s.id: s for s in db.query(Streamer).filter(Streamer.id.in_(lineup_ids)).all()} \
+        if lineup_ids else {}
+    lineup = [StreamerOut.model_validate(smap[i]) for i in lineup_ids if i in smap]
+    cur = db.get(Streamer, row.current_streamer_id) if row.current_streamer_id else None
+    return SessionOut(
+        id=row.id, title=row.title, share_link=row.share_link, room_id=row.room_id,
+        stream_url=row.stream_url, status=row.status.value, error_msg=row.error_msg,
+        started_at=row.started_at, ended_at=row.ended_at, created_at=row.created_at,
+        audio=AudioOut.model_validate(row.audio) if row.audio else None,
+        current_streamer_id=row.current_streamer_id,
+        current_streamer_name=cur.name if cur else "",
+        lineup=lineup,
+    )
+
+
+@router.post("", response_model=SessionOut)
+async def create_session(payload: SessionCreate, db: Session = Depends(get_db)):
+    lineup = [i for i in payload.streamer_ids if db.get(Streamer, i)]
+    row = ReplaySession(
+        title=payload.title, share_link=payload.share_link,
+        lineup=json.dumps(lineup),
+        current_streamer_id=(lineup[0] if lineup else None),
+        status=SessionStatus.parsing,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    room_title = ""
+    try:
+        res = await douyin.resolve_stream(
+            share_link=payload.share_link, manual_url=payload.manual_stream_url,
+            cookie=get_settings().douyin_cookie,
+        )
+        row.room_id = res.room_id
+        row.stream_url = res.stream_url
+        row.status = SessionStatus.created
+        room_title = (res.title or "").strip()
+    except douyin.ParseError as e:
+        row.status = SessionStatus.created
+        row.error_msg = "直播源解析失败，请确认链接有效或填写可控拉流地址"
+    # 自动命名（用户没填标题时）：直播间标题 + 日期时间，一眼看懂是哪场
+    if not (payload.title or "").strip():
+        base = room_title or (f"房间{row.room_id}" if row.room_id else "直播")
+        row.title = f"{base[:40]} · {datetime.now():%m-%d %H:%M} 复盘"
+    # 收录/更新「常用直播间」列表（按 room_id 去重），之后可从列表复选
+    if row.room_id:
+        rm = db.query(LiveRoom).filter(LiveRoom.room_id == row.room_id).first()
+        if not rm:
+            rm = LiveRoom(room_id=row.room_id)
+            db.add(rm)
+        if room_title:
+            rm.title = room_title
+        if payload.share_link:
+            rm.share_link = payload.share_link
+        rm.last_used_at = datetime.now()
+    db.commit()
+    db.refresh(row)
+    return _session_out(db, row)
+
+
+@router.get("", response_model=list[SessionOut])
+def list_sessions(db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(ReplaySession).order_by(ReplaySession.id.desc())
+    ).scalars().all()
+    return [_session_out(db, r) for r in rows]
+
+
+@router.get("/{session_id}", response_model=SessionOut)
+def get_session(session_id: int, db: Session = Depends(get_db)):
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    return _session_out(db, row)
+
+
+@router.post("/{session_id}/start", response_model=SessionOut)
+async def start_session(session_id: int,
+                        streamer_ids: list[int] | None = Body(None, embed=True),
+                        db: Session = Depends(get_db)):
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    # 防重复开播污染历史：仅草稿(created)或上次失败(error)可开播；done/processing/live 拒绝
+    if row.status not in (SessionStatus.created, SessionStatus.error):
+        raise HTTPException(409, f"场次当前为「{row.status.value}」，不能重复开播；如需重跑请新建场次")
+    # 开播时应用当前排班：草稿是粘链接时自动建的、那一刻往往还没选主播，
+    # 故以开播一刻前端传来的排班为准，避免主播丢失（仍显示"未指定主播"）。
+    if streamer_ids is not None:
+        lineup = [i for i in streamer_ids if db.get(Streamer, i)]
+        row.lineup = json.dumps(lineup)
+        row.current_streamer_id = lineup[0] if lineup else None
+        db.commit()
+        db.refresh(row)
+    # 无拉流地址时走合成测试流（mock 识别）；有地址则真实拉流 + 真实 ASR/OCR
+    start_pipeline(session_id)
+    return _session_out(db, row)
+
+
+@router.post("/{session_id}/stop", response_model=SessionOut)
+def stop_session(session_id: int, db: Session = Depends(get_db)):
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    stop_pipeline(session_id)
+    return _session_out(db, row)
+
+
+@router.post("/{session_id}/switch", response_model=SessionOut)
+async def switch_streamer(session_id: int, payload: SwitchIn, db: Session = Depends(get_db)):
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    try:
+        lineup = json.loads(row.lineup) if row.lineup else []
+    except json.JSONDecodeError:
+        lineup = []
+
+    target = payload.streamer_id
+    if payload.next:
+        if not lineup:
+            raise HTTPException(400, "未配置排班，无法自动切下一位")
+        cur = row.current_streamer_id
+        idx = lineup.index(cur) if cur in lineup else -1
+        target = lineup[(idx + 1) % len(lineup)]
+    if target is None or not db.get(Streamer, target):
+        raise HTTPException(400, "目标主播无效")
+
+    p = get_running(session_id)
+    if p:
+        await p.switch_streamer(target)   # 直播中：记班次 + 推送
+        db.refresh(row)
+    else:
+        row.current_streamer_id = target  # 未开播：仅设定开播主播
+        db.commit()
+    return _session_out(db, row)
+
+
+@router.get("/{session_id}/streamers", response_model=list[StreamerReviewOut])
+def session_streamers(session_id: int, db: Session = Depends(get_db)):
+    """按主播分组的复盘聚合（每个主播的句数、告警数、班次、整场总结）。"""
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+
+    turns = db.execute(
+        select(StreamerTurn).where(StreamerTurn.session_id == session_id)
+        .order_by(StreamerTurn.seq)
+    ).scalars().all()
+    transcripts = db.execute(
+        select(Transcript).where(Transcript.session_id == session_id)
+    ).scalars().all()
+    critiques = db.execute(
+        select(Critique).where(Critique.session_id == session_id)
+    ).scalars().all()
+
+    try:
+        lineup = json.loads(row.lineup) if row.lineup else []
+    except json.JSONDecodeError:
+        lineup = []
+    ordered: list[int | None] = list(lineup)
+    for coll in (turns, transcripts, critiques):
+        for x in coll:
+            if x.streamer_id not in ordered:
+                ordered.append(x.streamer_id)
+
+    out: list[StreamerReviewOut] = []
+    for sid in ordered:
+        s = db.get(Streamer, sid) if sid else None
+        summary = next((c for c in critiques
+                        if c.streamer_id == sid and c.level == CritiqueLevel.summary), None)
+        out.append(StreamerReviewOut(
+            streamer_id=sid or 0,
+            name=s.name if s else "未指定主播",
+            color=s.color if s else "",
+            sentence_count=sum(1 for t in transcripts if t.streamer_id == sid),
+            flag_count=sum(1 for c in critiques if c.streamer_id == sid
+                           and c.level in (CritiqueLevel.sentence, CritiqueLevel.screen)),
+            turns=[{"start_ms": t.start_ms, "end_ms": t.end_ms}
+                   for t in turns if t.streamer_id == sid],
+            summary=CritiqueOut.model_validate(summary) if summary else None,
+            overall_score=summary.score if summary else None,
+        ))
+    return out
+
+
+@router.get("/{session_id}/transcripts", response_model=list[TranscriptOut])
+def list_transcripts(session_id: int, streamer_id: int | None = None,
+                     db: Session = Depends(get_db)):
+    stmt = select(Transcript).where(Transcript.session_id == session_id)
+    if streamer_id is not None:
+        stmt = stmt.where(Transcript.streamer_id == streamer_id)
+    return db.execute(stmt.order_by(Transcript.seq)).scalars().all()
+
+
+@router.get("/{session_id}/roles")
+def session_roles(session_id: int, streamer_id: int | None = None,
+                  db: Session = Depends(get_db)):
+    """主播 / 场控双线分工（从内容自动分搭话）。场控当前不出声则 assist_count=0。"""
+    from ..core.roles import analyze_roles
+    stmt = select(Transcript).where(Transcript.session_id == session_id)
+    if streamer_id is not None:
+        stmt = stmt.where(Transcript.streamer_id == streamer_id)
+    trs = db.execute(stmt.order_by(Transcript.seq)).scalars().all()
+    return analyze_roles(trs)
+
+
+@router.post("/{session_id}/emotion/recompute")
+def recompute_emotion(session_id: int, streamer_id: int | None = None,
+                      db: Session = Depends(get_db)):
+    """用 qwen3-asr-flash 对每个点评段识别情绪(7类)，写回段级 + 聚合整场分布。"""
+    from ..core import qwen_emotion
+    from ..core.emotion_recompute import recompute_session_emotions
+    if not qwen_emotion.enabled():
+        raise HTTPException(400, "未配置百炼 key，无法用 Qwen 识别情绪")
+    if not db.get(ReplaySession, session_id):
+        raise HTTPException(404, "场次不存在")
+    res = recompute_session_emotions(session_id, streamer_id)
+    if res.get("error") == "no_audio":
+        raise HTTPException(404, "本场无录音，无法识别情绪")
+    if res.get("error") == "no_source":
+        raise HTTPException(404, "源音频不可用（本地已清理且无 COS 备份）")
+    return res
+
+
+_COMPASS_JS = r'''javascript:(function(){var U="__URL__",T="__TOKEN__";function g(){var m={},KS=["在线","观看","累计观看","成交金额","成交","GMV","转化率","转化","点赞","曝光","进入率","停留","客单价","订单","销量","粉丝","涨粉"];var els=document.querySelectorAll("body *");for(var i=0;i<els.length;i++){var e=els[i];if(e.children.length)continue;var t=(e.textContent||"").trim();if(!t||t.length>10)continue;for(var k=0;k<KS.length;k++){if(t.indexOf(KS[k])>=0){var v="",s=e.nextElementSibling;if(s)v=(s.textContent||"").trim();if(!v||!/[0-9]/.test(v)){var p=e.parentElement;if(p)v=(p.textContent||"").replace(t,"").trim()}if(v&&/[0-9]/.test(v))m[KS[k]]=v.slice(0,20)}}}try{navigator.sendBeacon(U,JSON.stringify({token:T,data:m}))}catch(x){}}g();if(window.__cmp)clearInterval(window.__cmp);window.__cmp=setInterval(g,30000);alert("罗盘上报已启动(每30秒),保持本页打开。停止请刷新本页。")})();'''
+
+
+def _build_bookmarklet(url: str, token: str) -> str:
+    return _COMPASS_JS.replace("__URL__", url).replace("__TOKEN__", token)
+
+
+@router.get("/{session_id}/compass/setup")
+def compass_setup(session_id: int, request: Request, db: Session = Depends(get_db)):
+    """生成/返回罗盘上报书签（bookmarklet）+ token。"""
+    import secrets
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    if not row.compass_token:
+        row.compass_token = secrets.token_urlsafe(18)
+        db.commit()
+    # 未挂载的旧副本（线上用 api/sessions.py），与之保持一致：对外地址取 PUBLIC_BASE_URL
+    url = public_url(f"/api/sessions/{session_id}/compass")
+    return {"token": row.compass_token, "url": url,
+            "bookmarklet": _build_bookmarklet(url, row.compass_token)}
+
+
+@router.post("/{session_id}/compass")
+async def compass_report(session_id: int, request: Request, db: Session = Depends(get_db)):
+    """罗盘书签上报数据点（公开端点，靠 token 校验；不走 cookie 鉴权）。"""
+    import hmac
+    row = db.get(ReplaySession, session_id)
+    if not row or not row.compass_token:
+        raise HTTPException(404, "场次不存在或未启用罗盘")
+    if row.ended_at:                          # 收播后不再收，避免晚到点偏移错乱
+        raise HTTPException(409, "场次已结束，无需再上报")
+    body = await request.body()
+    if len(body) > 8192:                      # 单次体积上限，防公开端点被灌爆
+        raise HTTPException(413, "数据过大")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(400, "数据格式错误")
+    if not hmac.compare_digest(str(payload.get("token") or ""), row.compass_token):
+        raise HTTPException(403, "token 无效")
+    if db.query(CompassPoint).filter(CompassPoint.session_id == session_id).count() >= 5000:
+        raise HTTPException(429, "本场罗盘数据点已达上限")
+    data = payload.get("data") or {}
+    ds = json.dumps(data, ensure_ascii=False)[:4000]   # data 长度上限
+    start_ms = max(0, int((datetime.now() - row.started_at).total_seconds() * 1000)) if row.started_at else 0
+    db.add(CompassPoint(session_id=session_id, start_ms=start_ms, data=ds))
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/{session_id}/compass")
+def compass_list(session_id: int, db: Session = Depends(get_db)):
+    pts = db.execute(select(CompassPoint).where(CompassPoint.session_id == session_id)
+                     .order_by(CompassPoint.start_ms)).scalars().all()
+    def _d(p):
+        try:
+            return json.loads(p.data) if p.data else {}
+        except json.JSONDecodeError:
+            return {}
+    return [{"start_ms": p.start_ms, "data": _d(p),
+             "at": p.created_at.isoformat() if p.created_at else None} for p in pts]
+
+
+@router.get("/{session_id}/danmaku_signals")
+def danmaku_signals(session_id: int, db: Session = Depends(get_db)):
+    """公屏弱信号识别 + 归因（疑问/购买意向/异议/正负向）。"""
+    from ..core.danmaku_signal import analyze_session_danmaku
+    return analyze_session_danmaku(session_id)
+
+
+@router.get("/{session_id}/attribution")
+def attribution(session_id: int, db: Session = Depends(get_db)):
+    """成交归因：成交时刻映射到话术段，判断话术驱动 vs 自然成交。"""
+    from ..core.attribution import analyze_attribution
+    return analyze_attribution(session_id)
+
+
+@router.get("/{session_id}/critiques", response_model=list[CritiqueOut])
+def list_critiques(session_id: int, level: str | None = None,
+                   streamer_id: int | None = None, db: Session = Depends(get_db)):
+    stmt = select(Critique).where(Critique.session_id == session_id)
+    if level:
+        stmt = stmt.where(Critique.level == CritiqueLevel(level))
+    if streamer_id is not None:
+        stmt = stmt.where(Critique.streamer_id == streamer_id)
+    return db.execute(stmt.order_by(Critique.id)).scalars().all()
+
+
+@router.get("/{session_id}/live.flv")
+async def live_video(
+    session_id: int,
+    quality: str = Query("clear", pattern="^(smooth|clear|high|source)$"),
+    db: Session = Depends(get_db),
+):
+    """实时直播画面（内存转发，不落盘）。默认清晰预览，可切换流畅/原画。"""
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    # 生产环境无拉流地址（未开播/链接无效/已结束）→ 明确报错，不回退 mock 彩条误导用户
+    if not row.stream_url and get_settings().asr_provider != "mock":
+        raise HTTPException(409, "该场次无实时画面：直播未开播、链接无效或场次已结束")
+    return StreamingResponse(open_live_stream(row.stream_url, quality), media_type="video/x-flv")
+
+
+@router.get("/{session_id}/audio/download")
+def download_audio(session_id: int, streamer_id: int | None = None,
+                   db: Session = Depends(get_db)):
+    af = get_audio(db, session_id)
+    if not af or af.status == AudioStatus.deleted:
+        raise HTTPException(404, "媒体不存在或已删除")
+    if streamer_id:   # 按主播出镜时段裁剪
+        return _clip_audio_by_streamer(db, session_id, af, streamer_id)
+    row = db.get(ReplaySession, session_id)
+    kind = getattr(af, "media_kind", "audio")
+    fname = _media_filename(db, row, None, kind) if row else af.filename
+    if af.cos_key:   # 已上 COS：跳转临时签名 URL（附可读下载名）
+        url = media_store.presigned_url(af.cos_key, expires=7200, filename=fname)
+        if url:
+            return RedirectResponse(url)
+    p = Path(af.path)
+    if not p.exists():
+        raise HTTPException(404, "磁盘文件缺失（可能已被删除）")
+    mt = "video/mp4" if kind == "video" else "audio/mp4"
+    return FileResponse(path=str(p), filename=fname, media_type=mt)
+
+
+def _audio_source(af) -> str | None:
+    """裁剪用源：本地文件优先，否则 COS 预签名 URL（ffmpeg 可直接读，支持 Range）。"""
+    if af.path and Path(af.path).exists():
+        return str(af.path)
+    if af.cos_key:
+        return media_store.presigned_url(af.cos_key, expires=3600)
+    return None
+
+
+def _clip_audio_by_streamer(db: Session, session_id: int, af, streamer_id: int):
+    row = db.get(ReplaySession, session_id)
+    turns = db.execute(
+        select(StreamerTurn).where(StreamerTurn.session_id == session_id,
+                                   StreamerTurn.streamer_id == streamer_id)
+        .order_by(StreamerTurn.seq)
+    ).scalars().all()
+    if not turns:
+        raise HTTPException(404, "该主播在本场没有出镜时段，无法按主播裁剪音频")
+    total_ms = None
+    if row and row.started_at and row.ended_at:
+        total_ms = int((row.ended_at - row.started_at).total_seconds() * 1000)
+
+    fname = _media_filename(db, row, streamer_id, "audio") if row else f"streamer{streamer_id}.m4a"
+    # 该主播几乎覆盖整场（单段且全程）→ 直接返回整场，免裁剪
+    if len(turns) == 1:
+        t0 = turns[0]
+        covers_all = (t0.start_ms or 0) <= 1500 and (
+            not t0.end_ms or t0.end_ms <= t0.start_ms
+            or (total_ms and t0.end_ms >= total_ms - 1500))
+        if covers_all:
+            if af.cos_key:
+                url = media_store.presigned_url(af.cos_key, expires=7200, filename=fname)
+                if url:
+                    return RedirectResponse(url)
+            if af.path and Path(af.path).exists():
+                return FileResponse(af.path, filename=fname, media_type="audio/mp4")
+
+    source = _audio_source(af)
+    if not source:
+        raise HTTPException(404, "源音频不可用（本地已清理且无 COS 备份）")
+
+    tmpdir = tempfile.mkdtemp(prefix=f"clip_{session_id}_{streamer_id}_")
+    seg_files: list[str] = []
+    try:
+        for i, t in enumerate(turns):
+            start = max(0, t.start_ms) / 1000.0
+            end_ms = t.end_ms if (t.end_ms and t.end_ms > t.start_ms) else (total_ms or 0)
+            dur_args = []
+            if end_ms and end_ms > t.start_ms:
+                dur_args = ["-t", f"{(end_ms - t.start_ms) / 1000.0:.3f}"]
+            out = os.path.join(tmpdir, f"seg{i}.m4a")
+            # -c copy 远程 remux（音频 aac 逐帧独立，秒级、精度足够）
+            cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                   "-ss", f"{start:.3f}", "-i", source, *dur_args,
+                   "-vn", "-c", "copy", "-movflags", "+faststart", out]
+            r = subprocess.run(cmd, capture_output=True, timeout=600)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                seg_files.append(out)
+        # 任一时段裁剪失败即视为不完整，宁可明确报错也不静默给残缺音频
+        if len(seg_files) < len(turns):
+            raise HTTPException(
+                502, f"该主播有 {len(turns)} 个出镜时段，仅成功裁剪 {len(seg_files)} 段，"
+                     f"结果不完整。请稍后重试或改导出整场音频。")
+        if len(seg_files) == 1:
+            final = seg_files[0]
+        else:
+            final = os.path.join(tmpdir, "final.m4a")
+            listf = os.path.join(tmpdir, "list.txt")
+            with open(listf, "w") as f:
+                for s in seg_files:
+                    f.write(f"file '{s}'\n")
+            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "concat", "-safe", "0", "-i", listf, "-c", "copy", final],
+                           capture_output=True, timeout=600)
+            if not (os.path.exists(final) and os.path.getsize(final) > 0):
+                raise HTTPException(502, "多段音频拼接失败，请稍后重试或改导出整场音频。")
+    except HTTPException:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(504, "音频裁剪超时（源较大或网络较慢），请稍后重试或改导出整场音频。")
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(500, "音频裁剪异常")
+
+    return FileResponse(final, filename=fname, media_type="audio/mp4",
+                        background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True))
+
+
+@router.get("/{session_id}/media_url")
+def media_url(session_id: int, db: Session = Depends(get_db)):
+    """给复盘工作台/分段回放用：返回可播放的媒体 URL（COS 签名或本地下载路径）+ 类型。"""
+    af = get_audio(db, session_id)
+    if not af or af.status == AudioStatus.deleted:
+        return {"available": False}
+    kind = getattr(af, "media_kind", "audio")
+    if af.cos_key:
+        url = media_store.presigned_url(af.cos_key, expires=7200)
+        if url:
+            return {"available": True, "kind": kind, "url": url}
+    if af.path and Path(af.path).exists():
+        return {"available": True, "kind": kind,
+                "url": f"/api/sessions/{session_id}/audio/download"}
+    return {"available": False}
+
+
+@router.delete("/{session_id}/audio")
+def delete_audio(session_id: int, db: Session = Depends(get_db)):
+    removed, msg = hard_delete_audio(db, session_id)
+    return {"removed": removed, "message": msg}
+
+
+@router.delete("/{session_id}")
+def delete_session(session_id: int, db: Session = Depends(get_db)):
+    """彻底删除整个场次（转写/点评/OCR/班次/录音一并删除，不可恢复）。"""
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    stop_pipeline(session_id)   # 若在跑先停
+    if row.audio:
+        if row.audio.path:
+            Path(row.audio.path).unlink(missing_ok=True)
+        if row.audio.cos_key:
+            media_store.delete(row.audio.cos_key)   # 同步删 COS 对象
+    db.delete(row)              # cascade 删除转写/点评/OCR/班次/音频记录
+    db.commit()
+    return {"deleted": True}
+
+
+def _wt(started_at, start_ms: int) -> str:
+    """相对毫秒 → 墙钟 HH:MM:SS（无开播时间则退化为 mm:ss）。"""
+    if started_at:
+        return (started_at + timedelta(milliseconds=start_ms)).strftime("%H:%M:%S")
+    s = (start_ms or 0) // 1000
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _rhythm_line(data: str) -> str:
+    """段级 critique.data 里的节奏指标 → 一行人读文本（导出用）。"""
+    try:
+        m = (json.loads(data) or {}).get("metrics") if data else None
+    except json.JSONDecodeError:
+        m = None
+    if not m:
+        return ""
+    cv = m.get("energy_cv")
+    extra = f" · 响度起伏 {cv}" if cv is not None else ""
+    return (f"语速 {m.get('wpm', 0)} 字/分 · 冷场 {m.get('cold_opens', 0)} 次 · "
+            f"停顿均 {m.get('avg_pause_ms', 0)}ms · 重复 {int(m.get('repeat_ratio', 0) * 100)}% · "
+            f"互动 {m.get('ask_count', 0)} · 弹幕 {m.get('danmaku', 0)}{extra}")
+
+
+def _emotion_of(data: str) -> str:
+    """段级 critique.data 里的语气情绪标签（优先 Qwen 识别，其次 LLM 判定）。"""
+    try:
+        d = (json.loads(data) or {}) if data else {}
+    except json.JSONDecodeError:
+        return ""
+    return d.get("asr_emotion_label") or d.get("emotion") or ""
+
+
+def _scene_of(data: str) -> str:
+    """段级 critique.data 里的话术场景标签。"""
+    try:
+        return ((json.loads(data) or {}).get("scene_label") or "") if data else ""
+    except json.JSONDecodeError:
+        return ""
+
+
+def _pitch_line(data: str) -> str:
+    """段级语调（真实音高 F0）一行。"""
+    try:
+        pt = (json.loads(data) or {}).get("pitch") if data else None
+    except json.JSONDecodeError:
+        pt = None
+    if not pt or not pt.get("pitch_hz"):
+        return ""
+    return f"语调 {pt.get('label', '')} · 均值 {pt['pitch_hz']}Hz · 起伏 {pt.get('pitch_cv', 0)}"
+
+
+def _loop_line(data: str) -> str:
+    """段级讲款闭环缺失提示（一行，仅讲款段且有缺失时）。"""
+    try:
+        lp = (json.loads(data) or {}).get("loop") if data else None
+    except json.JSONDecodeError:
+        lp = None
+    if not lp or not lp.get("missing"):
+        return ""
+    return f"讲款闭环 {lp.get('pct', 0)}% · 缺：{'、'.join(lp['missing'])}"
+
+
+def _fmt_dt(dt) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "-"
+
+
+def _export_data(db: Session, row: ReplaySession):
+    sname = {s.id: s.name for s in db.query(Streamer).all()}
+    def nm(sid):
+        return (sname.get(sid) if sid else None) or "未指定主播"
+    trs = db.execute(select(Transcript).where(Transcript.session_id == row.id)
+                     .order_by(Transcript.seq)).scalars().all()
+    crs = db.execute(select(Critique).where(Critique.session_id == row.id)).scalars().all()
+    ocr = db.execute(select(OcrRecord).where(OcrRecord.session_id == row.id)
+                     .order_by(OcrRecord.start_ms)).scalars().all()
+    segs = sorted((c for c in crs if c.level == CritiqueLevel.segment), key=lambda c: c.start_ms)
+    sflags = [c for c in crs if c.level == CritiqueLevel.sentence]
+    summaries = [c for c in crs if c.level == CritiqueLevel.summary]
+    return nm, trs, ocr, segs, sflags, summaries
+
+
+def _loads(data) -> dict:
+    try:
+        return (json.loads(data) or {}) if data else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _item_text(x) -> str:
+    """top_issues / action_items 里既可能是字符串、也可能是 {action,source} 对象，统一取正文。"""
+    if isinstance(x, dict):
+        return str(x.get("action") or x.get("text") or x.get("issue")
+                   or x.get("title") or x.get("content") or "")
+    return str(x if x is not None else "")
+
+
+def _item_src(x) -> str:
+    return str(x.get("source") or "") if isinstance(x, dict) else ""
+
+
+def _order_sids(summaries, segs, trs) -> list[int]:
+    seen: list[int] = []
+    for coll in (summaries, segs, trs):
+        for x in coll:
+            if x.streamer_id and x.streamer_id not in seen:
+                seen.append(x.streamer_id)
+    return seen
+
+
+# ---- Markdown 渲染片段 ----
+
+def _summary_md(L, c, nm) -> None:
+    L.append(f"\n### {nm(c.streamer_id)}　综合 {c.score if c.score is not None else '-'} 分")
+    d = _loads(c.data)
+    if d.get("dimensions"):
+        L.append("- 维度评分：" + " ｜ ".join(f"{k} {v}" for k, v in d["dimensions"].items()))
+    if d.get("emotion"):
+        L.append(f"- 整体语气情绪：{d['emotion']}")
+    ov = d.get("emotion_overview") or {}
+    if ov.get("dist"):
+        L.append("- 语音情绪分布(Qwen)：" + " · ".join(f"{x['label']} {x['pct']}%" for x in ov["dist"])
+                 + (f"（主导：{ov['dominant']}）" if ov.get("dominant") else ""))
+    st = d.get("structure") or {}
+    if st.get("arc"):
+        L.append(f"- 整场环节结构：{' → '.join(st['arc'])}")
+        if st.get("distribution"):
+            L.append("- 各环节占比：" + "；".join(f"{x['scene']} {x['pct']}%" for x in st["distribution"]))
+    if d.get("structure_review"):
+        L.append(f"- 话术逻辑点评：{d['structure_review']}")
+    for x in (st.get("diagnostics") or []):
+        L.append(f"  - ⚠️ {x}")
+    lp = d.get("loop") or {}
+    if lp.get("product_segments"):
+        L.append(f"- 讲款闭环：讲款段 {lp['product_segments']} 个 · 平均完整度 {lp.get('avg_completeness', 0)}%"
+                 + (f" · 常缺环节：{'、'.join(lp['often_missing'])}" if lp.get("often_missing") else " · 环节基本齐全"))
+    if c.comment:
+        L.append(f"\n{c.comment}")
+    if d.get("top_issues"):
+        L.append("\n**Top 问题**")
+        L += [f"{i + 1}. {_item_text(x)}" for i, x in enumerate(d["top_issues"])]
+    if d.get("action_items"):
+        L.append("\n**改进行动项**")
+        for i, x in enumerate(d["action_items"]):
+            src = _item_src(x)
+            L.append(f"{i + 1}. {_item_text(x)}" + (f"（来源：{src}）" if src else ""))
+
+
+def _timeline_md(L, started, trs, segs, sflags, ocr, nm) -> None:
+    used_t, used_f, used_d = set(), set(), set()
+    if segs:
+        for i, seg in enumerate(segs):
+            b = 10 ** 15 if i == len(segs) - 1 else segs[i + 1].start_ms
+            L.append(f"\n#### [{_wt(started, seg.start_ms)} – {_wt(started, seg.end_ms)}]　"
+                     f"段级点评 {seg.score if seg.score is not None else ''}分")
+            sc = _scene_of(seg.data)
+            if sc:
+                L.append(f"> 话术场景：{sc}")
+            ll = _loop_line(seg.data)
+            if ll:
+                L.append(f"> {ll}")
+            if seg.comment:
+                L.append(f"> {seg.comment}")
+            rl = _rhythm_line(seg.data)
+            if rl:
+                L.append(f"> 节奏：{rl}")
+            emo = _emotion_of(seg.data)
+            if emo:
+                L.append(f"> 语气情绪：{emo}")
+            pl = _pitch_line(seg.data)
+            if pl:
+                L.append(f"> {pl}")
+            L.append("\n**话术：**")
+            any_t = False
+            for t in trs:
+                if t.start_ms <= b and t.id not in used_t:
+                    used_t.add(t.id)
+                    any_t = True
+                    L.append(f"- `{_wt(started, t.start_ms)}` [{nm(t.streamer_id)}] {t.corrected_text}")
+            if not any_t:
+                L.append("- （本段无转写；可能无人说话或识别未产出）")
+            fl = [c for c in sflags if c.start_ms <= b and c.id not in used_f]
+            if fl:
+                L.append("\n**句级硬错：**")
+                for c in fl:
+                    used_f.add(c.id)
+                    L.append(f"- `{_wt(started, c.start_ms)}` ⚠️ [{c.category}] {c.comment}（原话：{c.quote}）")
+            dm = [o for o in ocr if o.start_ms <= b and o.id not in used_d]
+            if dm:
+                L.append("\n**弹幕：**")
+                for o in dm:
+                    used_d.add(o.id)
+                    L.append(f"- `{_wt(started, o.start_ms)}` {o.text}")
+    elif trs:
+        L.append("")
+        for t in trs:
+            L.append(f"- `{_wt(started, t.start_ms)}` [{nm(t.streamer_id)}] {t.corrected_text}")
+    else:
+        L.append("\n_（无话术记录。）_")
+
+
+def _build_markdown(db: Session, row: ReplaySession,
+                    only_sid: int | None = None, by_role: bool = False) -> str:
+    nm, trs, ocr, segs, sflags, summaries = _export_data(db, row)
+    started = row.started_at
+    note = (f"（仅主播：{nm(only_sid)}）" if only_sid
+            else "（按主播角色分章）" if by_role else "")
+
+    L = [f"# {row.title or '直播复盘'}　(场次 #{row.id}){note}", ""]
+    L.append(f"- 开播：{_fmt_dt(started)}　结束：{_fmt_dt(row.ended_at)}")
+    if row.room_id:
+        L.append(f"- 房间号：{row.room_id}")
+    L.append(f"- 统计：{len(trs)} 句话术 · {len(segs)} 个段级点评 · "
+             f"{len(sflags)} 处硬错 · {len(ocr)} 条弹幕")
+    try:
+        _multi = len(json.loads(row.lineup or "[]")) >= 2
+    except (json.JSONDecodeError, TypeError):
+        _multi = False
+    if _multi:   # 仅多主播场次才谈场控双线（单主播无场控概念，避免误导）
+        from ..core.roles import analyze_roles
+        _rl = analyze_roles(trs)
+        if _rl["assist_count"] > 0:
+            L.append(f"- 主播/场控分工：主讲 {_rl['host_count']} 句 · 场控搭话 "
+                     f"{_rl['assist_count']} 句（{_rl['assist_ratio']}%）")
+
+    if only_sid or by_role:
+        ids = [only_sid] if only_sid else _order_sids(summaries, segs, trs)
+        # by_role 是全量重排：若存在未指定主播(streamer_id=None)的内容，补一章兜底，避免静默丢句
+        if by_role and any(x.streamer_id is None for x in (*trs, *segs, *sflags)):
+            ids = ids + [None]
+        if not ids:
+            L.append("\n_（无主播归属数据可分。）_")
+            return "\n".join(L)
+        for sid in ids:
+            L.append(f"\n## 主播：{nm(sid)}")
+            csum = next((c for c in summaries if c.streamer_id == sid), None)
+            if csum:
+                _summary_md(L, csum, nm)
+            elif sid is not None:
+                L.append("\n_（该主播无整场报告）_")
+            L.append(f"\n### 时间轴明细 · {nm(sid)}")
+            _timeline_md(L, started,
+                         [t for t in trs if t.streamer_id == sid],
+                         [c for c in segs if c.streamer_id == sid],
+                         [c for c in sflags if c.streamer_id == sid],
+                         [o for o in ocr if o.streamer_id == sid], nm)
+        return "\n".join(L)
+
+    # 整场
+    L.append("\n## 一、整场复盘报告")
+    if summaries:
+        for c in summaries:
+            _summary_md(L, c, nm)
+    else:
+        L.append("\n_（本场未生成整场报告：可能未点「结束采集」正常收尾，或话术过少。）_")
+    L.append("\n## 二、时间轴逐段明细")
+    _timeline_md(L, started, trs, segs, sflags, ocr, nm)
+    return "\n".join(L)
+
+
+# ---- Word 渲染片段 ----
+
+def _summary_docx(doc, c, nm) -> None:
+    doc.add_heading(f"{nm(c.streamer_id)}　综合 {c.score if c.score is not None else '-'} 分", level=2)
+    d = _loads(c.data)
+    if d.get("dimensions"):
+        doc.add_paragraph("维度评分：" + " ｜ ".join(f"{k} {v}" for k, v in d["dimensions"].items()))
+    if d.get("emotion"):
+        doc.add_paragraph("整体语气情绪：" + str(d["emotion"]))
+    ov = d.get("emotion_overview") or {}
+    if ov.get("dist"):
+        doc.add_paragraph("语音情绪分布(Qwen)：" + " · ".join(f"{x['label']} {x['pct']}%" for x in ov["dist"])
+                          + (f"（主导：{ov['dominant']}）" if ov.get("dominant") else ""))
+    st = d.get("structure") or {}
+    if st.get("arc"):
+        doc.add_paragraph("整场环节结构：" + " → ".join(st["arc"]))
+        if st.get("distribution"):
+            doc.add_paragraph("各环节占比：" + "；".join(f"{x['scene']} {x['pct']}%" for x in st["distribution"]))
+    if d.get("structure_review"):
+        doc.add_paragraph("话术逻辑点评：" + str(d["structure_review"]))
+    for x in (st.get("diagnostics") or []):
+        doc.add_paragraph("⚠️ " + str(x), style="List Bullet")
+    lp = d.get("loop") or {}
+    if lp.get("product_segments"):
+        doc.add_paragraph(
+            f"讲款闭环：讲款段 {lp['product_segments']} 个 · 平均完整度 {lp.get('avg_completeness', 0)}%"
+            + (f" · 常缺环节：{'、'.join(lp['often_missing'])}" if lp.get("often_missing") else " · 环节基本齐全"))
+    if c.comment:
+        doc.add_paragraph(c.comment)
+    if d.get("top_issues"):
+        doc.add_heading("Top 问题", level=3)
+        for x in d["top_issues"]:
+            doc.add_paragraph(_item_text(x), style="List Number")
+    if d.get("action_items"):
+        doc.add_heading("改进行动项", level=3)
+        for x in d["action_items"]:
+            src = _item_src(x)
+            doc.add_paragraph(_item_text(x) + (f"（来源：{src}）" if src else ""), style="List Number")
+
+
+def _timeline_docx(doc, started, trs, segs, sflags, ocr, nm) -> None:
+    used_t, used_f, used_d = set(), set(), set()
+    if segs:
+        for i, seg in enumerate(segs):
+            b = 10 ** 15 if i == len(segs) - 1 else segs[i + 1].start_ms
+            doc.add_heading(f"[{_wt(started, seg.start_ms)} – {_wt(started, seg.end_ms)}]　"
+                            f"段级点评 {seg.score if seg.score is not None else ''} 分", level=3)
+            sc = _scene_of(seg.data)
+            if sc:
+                doc.add_paragraph("话术场景：" + sc)
+            ll = _loop_line(seg.data)
+            if ll:
+                doc.add_paragraph(ll)
+            if seg.comment:
+                doc.add_paragraph(seg.comment)
+            rl = _rhythm_line(seg.data)
+            if rl:
+                doc.add_paragraph("节奏：" + rl)
+            emo = _emotion_of(seg.data)
+            if emo:
+                doc.add_paragraph("语气情绪：" + emo)
+            pl = _pitch_line(seg.data)
+            if pl:
+                doc.add_paragraph(pl)
+            doc.add_heading("话术", level=4)
+            any_t = False
+            for t in trs:
+                if t.start_ms <= b and t.id not in used_t:
+                    used_t.add(t.id)
+                    any_t = True
+                    p = doc.add_paragraph(style="List Bullet")
+                    p.add_run(f"[{_wt(started, t.start_ms)}] {nm(t.streamer_id)}：").bold = True
+                    p.add_run(t.corrected_text)
+            if not any_t:
+                doc.add_paragraph("（本段无转写；可能无人说话或识别未产出）")
+            fl = [c for c in sflags if c.start_ms <= b and c.id not in used_f]
+            if fl:
+                doc.add_heading("句级硬错", level=4)
+                for c in fl:
+                    used_f.add(c.id)
+                    doc.add_paragraph(f"⚠️ [{c.category}] {c.comment}（原话：{c.quote}）",
+                                      style="List Bullet")
+            dm = [o for o in ocr if o.start_ms <= b and o.id not in used_d]
+            if dm:
+                doc.add_heading("弹幕", level=4)
+                for o in dm:
+                    used_d.add(o.id)
+                    doc.add_paragraph(f"[{_wt(started, o.start_ms)}] {o.text}", style="List Bullet")
+    elif trs:
+        for t in trs:
+            p = doc.add_paragraph(style="List Bullet")
+            p.add_run(f"[{_wt(started, t.start_ms)}] {nm(t.streamer_id)}：").bold = True
+            p.add_run(t.corrected_text)
+    else:
+        doc.add_paragraph("（无话术记录。）")
+
+
+def _build_docx(db: Session, row: ReplaySession,
+                only_sid: int | None = None, by_role: bool = False) -> bytes:
+    from docx import Document
+
+    nm, trs, ocr, segs, sflags, summaries = _export_data(db, row)
+    started = row.started_at
+    note = (f"（仅主播：{nm(only_sid)}）" if only_sid
+            else "（按主播角色分章）" if by_role else "")
+    doc = Document()
+    doc.add_heading((row.title or "直播复盘") + note, level=0)
+    doc.add_paragraph(f"场次 #{row.id}　开播 {_fmt_dt(started)}　结束 {_fmt_dt(row.ended_at)}"
+                      + (f"　房间 {row.room_id}" if row.room_id else ""))
+    doc.add_paragraph(f"统计：{len(trs)} 句话术 · {len(segs)} 段点评 · "
+                      f"{len(sflags)} 处硬错 · {len(ocr)} 条弹幕")
+
+    if only_sid or by_role:
+        ids = [only_sid] if only_sid else _order_sids(summaries, segs, trs)
+        if by_role and any(x.streamer_id is None for x in (*trs, *segs, *sflags)):
+            ids = ids + [None]
+        if not ids:
+            doc.add_paragraph("（无主播归属数据可分。）")
+        for sid in ids:
+            doc.add_heading(f"主播：{nm(sid)}", level=1)
+            csum = next((c for c in summaries if c.streamer_id == sid), None)
+            if csum:
+                _summary_docx(doc, csum, nm)
+            elif sid is not None:
+                doc.add_paragraph("（该主播无整场报告）")
+            doc.add_heading(f"时间轴明细 · {nm(sid)}", level=2)
+            _timeline_docx(doc, started,
+                           [t for t in trs if t.streamer_id == sid],
+                           [c for c in segs if c.streamer_id == sid],
+                           [c for c in sflags if c.streamer_id == sid],
+                           [o for o in ocr if o.streamer_id == sid], nm)
+        buf = io.BytesIO()
+        doc.save(buf)
+        return buf.getvalue()
+
+    doc.add_heading("一、整场复盘报告", level=1)
+    if summaries:
+        for c in summaries:
+            _summary_docx(doc, c, nm)
+    else:
+        doc.add_paragraph("（本场未生成整场报告：可能未点「结束采集」正常收尾，或话术过少。）")
+    doc.add_heading("二、时间轴逐段明细", level=1)
+    _timeline_docx(doc, started, trs, segs, sflags, ocr, nm)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+_ILLEGAL_FN = re.compile(r'[\\/:*?"<>|\n\r\t]+')
+
+
+def _safe_name(s: str, limit: int = 40) -> str:
+    s = _ILLEGAL_FN.sub("", (s or "").strip()).replace(" ", "")
+    return s[:limit]
+
+
+def _export_basename(row: ReplaySession) -> str:
+    """『直播间名_MMDD_HHMM』——文件名前缀，一眼看出是哪个直播间哪场。"""
+    title = (row.title or "").split(" · ")[0].strip()      # 去掉标题里的 "· 时间 复盘" 后缀
+    base = _safe_name(title) or (f"房间{row.room_id}" if row.room_id else "直播复盘")
+    dt = row.started_at or row.created_at
+    return f"{base}_{dt:%m%d_%H%M}" if dt else base
+
+
+def _streamer_name(db: Session, sid: int) -> str:
+    st = db.get(Streamer, sid)
+    return _safe_name(st.name, 20) if st and st.name else str(sid)
+
+
+def _doc_filename(db: Session, row: ReplaySession, streamer_id: int | None,
+                  by_role: bool, ext: str) -> str:
+    if streamer_id:
+        scope = f"{_streamer_name(db, streamer_id)}复盘"
+    elif by_role:
+        scope = "分主播复盘"
+    else:
+        scope = "整场复盘"
+    return f"{_export_basename(row)}_{scope}.{ext}"
+
+
+def _media_filename(db: Session, row: ReplaySession, streamer_id: int | None,
+                    kind: str = "audio") -> str:
+    label = "直播回看" if kind == "video" else "录音"
+    ext = "mp4" if kind == "video" else "m4a"
+    who = f"{_streamer_name(db, streamer_id)}" if streamer_id else ""
+    return f"{_export_basename(row)}_{who}{label}.{ext}"
+
+
+def _cd_header(filename: str) -> str:
+    """Content-Disposition：现代浏览器用 filename*(UTF-8)，老浏览器用 ASCII 兜底。"""
+    ascii_fb = _ILLEGAL_FN.sub("", filename.encode("ascii", "ignore").decode()).strip() or "replay"
+    return f"attachment; filename=\"{ascii_fb}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def _assert_streamer_in_session(db: Session, session_id: int, sid: int | None) -> None:
+    """单主播导出/裁剪校验：该主播在本场须有归属数据，否则 404（避免产出误导性空文档）。"""
+    if not sid:
+        return
+    has = (db.query(Transcript).filter(Transcript.session_id == session_id,
+                                       Transcript.streamer_id == sid).first()
+           or db.query(Critique).filter(Critique.session_id == session_id,
+                                        Critique.streamer_id == sid).first()
+           or db.query(StreamerTurn).filter(StreamerTurn.session_id == session_id,
+                                            StreamerTurn.streamer_id == sid).first())
+    if not has:
+        raise HTTPException(404, "该主播在本场无复盘数据")
+
+
+@router.get("/{session_id}/export.md")
+def export_markdown(session_id: int, streamer_id: int | None = None,
+                    by_role: bool = False, db: Session = Depends(get_db)):
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    _assert_streamer_in_session(db, session_id, streamer_id)
+    md = _build_markdown(db, row, only_sid=streamer_id, by_role=by_role)
+    fname = _doc_filename(db, row, streamer_id, by_role, "md")
+    return PlainTextResponse(md, media_type="text/markdown; charset=utf-8",
+                             headers={"Content-Disposition": _cd_header(fname)})
+
+
+@router.get("/{session_id}/export.docx")
+def export_docx(session_id: int, streamer_id: int | None = None,
+                by_role: bool = False, db: Session = Depends(get_db)):
+    row = db.get(ReplaySession, session_id)
+    if not row:
+        raise HTTPException(404, "场次不存在")
+    _assert_streamer_in_session(db, session_id, streamer_id)
+    try:
+        data = _build_docx(db, row, only_sid=streamer_id, by_role=by_role)
+    except ModuleNotFoundError:
+        raise HTTPException(500, "服务器未安装 python-docx，无法导出 Word")
+    fname = _doc_filename(db, row, streamer_id, by_role, "docx")
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _cd_header(fname)},
+    )
+
+
+@router.post("/{session_id}/danmaku/reply")
+async def danmaku_reply(session_id: int, question: str = Body(..., embed=True),
+                        db: Session = Depends(get_db)):
+    """场控助手：主播答不上来时，按知识库优先生成可照说的建议回答。"""
+    if not db.get(ReplaySession, session_id):
+        raise HTTPException(404, "场次不存在")
+    kb = await retrieve_detailed(question, top_k=5)
+    kb_text = "\n".join(f"- {k['text']}" for k in kb) or "（无）"
+    recent = db.execute(select(Transcript).where(Transcript.session_id == session_id)
+                        .order_by(Transcript.seq.desc()).limit(4)).scalars().all()
+    ctx = " ".join(t.corrected_text for t in reversed(recent))[:300] or "（无）"
+    system = ("你是耳机直播间的场控助手。观众在弹幕里提问、主播一时答不上来，"
+              "请给主播一句可直接照说的简洁口语回答。优先依据知识库事实，"
+              "知识库没有的再据耳机常识补充，严禁编造型号/参数/价格。1-2 句、口语化。")
+    user = f"【知识库】\n{kb_text}\n\n【当前讲解】{ctx}\n\n【观众提问】{question}"
+    ans = await get_llm().complete(system, user)
+    return {"answer": (ans or "").strip()}
+
+
+@router.websocket("/{session_id}/ws")
+async def session_ws(websocket: WebSocket, session_id: int):
+    from ..sso import authenticate
+    if (await authenticate(websocket)).status != "ok":
+        await websocket.close(code=1008)   # 未登录 / 没开通
+        return
+    await websocket.accept()
+    q = bus.subscribe(session_id)
+    try:
+        while True:
+            event = await q.get()
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        bus.unsubscribe(session_id, q)

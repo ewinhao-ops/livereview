@@ -1,0 +1,6 @@
+[
+  {"input":"3.14 复制打开抖音 https://www.live.douyin.com/123456/?enter_method=copy_link_share&utm_source=chat#top","expected":"https://live.douyin.com/123456"},
+  {"input":"https://v.douyin.com/AbCdE/?foo=2&utm_campaign=sale&a=1","expected":"https://v.douyin.com/AbCdE?a=1&foo=2"},
+  {"input":"https://example.test:443/live/?b=2&a=1&a=0#player","expected":"https://example.test/live?a=1&a=0&b=2"},
+  {"input":"  非链接 分享口令 # 临时片段  ","expected":"非链接 分享口令"}
+]

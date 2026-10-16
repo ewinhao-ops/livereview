@@ -1,0 +1,42 @@
+name: Checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install uv==0.13.1
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: uv sync --frozen --extra dev
+        working-directory: backend
+      - run: uv run --no-sync pytest -q
+        working-directory: backend
+      - run: node --test frontend/tests/*.test.js
+  docker-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/setup.py --generate-password
+      - run: docker compose up -d --build
+      - name: Wait for the local application
+        run: |
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8765/api/health >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker compose logs --tail=80
+          exit 1
+      - run: python3 scripts/smoke_test.py
+      - if: always()
+        run: docker compose down

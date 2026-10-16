@@ -1,0 +1,13 @@
+services:
+  livereview:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    env_file:
+      - backend/.env
+    volumes:
+      - livereview-data:/opt/livereview/backend/data
+    init: true
+    restart: unless-stopped
+volumes:
+  livereview-data:

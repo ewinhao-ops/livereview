@@ -1,0 +1,43 @@
+[project]
+name = "livereview"
+version = "0.1.0"
+description = "LiveReview - evidence-based livestream review workspace"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.18.5,<1.19",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.27",
+    "python-multipart>=0.0.12",
+    "aiofiles>=24.1",
+    "openpyxl>=3.1",
+    "playwright>=1.50",
+    "python-docx>=1.1",
+    "pypdf>=4.0",
+    "dashscope>=1.20",
+    "praat-parselmouth>=0.4",
+    "cos-python-sdk-v5>=1.9",
+]
+
+[project.optional-dependencies]
+# 开发工具；真实直播 provider 已是主依赖，配置缺失或调用失败时不得伪装成 mock 成功。
+dev = [
+    "ruff>=0.7",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,28 @@
+name: 问题反馈
+description: 报告安装或使用问题，请先去掉所有敏感信息。
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: 请不要粘贴 API key、Cookie、密码、数据库、签名链接或真实用户资料。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 发生了什么
+      description: 预期结果与实际结果分别是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 如何复现
+      description: 请给出最少步骤和去敏后的错误信息。
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      placeholder: macOS / Linux / Windows，源码或 Docker，版本或提交号
+    validations:
+      required: true
